@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# fence - one cached verdict: may this node run its primary service?
+#
+# The problem it solves
+# --------------------
+# Two machines can both serve the same role (hub, coordinator, writer, job
+# runner). The standby must not take over just because it rebooted first, and
+# the primary must not keep serving after a peer with a higher epoch appears.
+# Every component that can start or keep the service alive needs the same
+# answer, or you get three slightly different split-brain windows.
+#
+# Verdict (exit code)
+#   0  active    this node may serve
+#   1  fenced    peer holds a higher epoch -> stand down
+#   2  unprobed  peer did not answer -> caller decides fail-open or fail-closed
+#
+# Verdicts are cached for FENCE_TTL seconds, so a six-component stack makes one
+# probe per TTL, not six. Only fresh probes are appended to the history file.
+#
+# Configuration (env)
+#   FENCE_PEER_URL            required. Endpoint returning {"epoch": N} or a bare integer
+#   FENCE_LOCAL_EPOCH_FILE    file holding this node's epoch (default: $FENCE_STATE_DIR/local-epoch)
+#   FENCE_LOCAL_EPOCH         epoch to use when no file exists (default: 1)
+#   FENCE_TTL                 cache seconds (default: 20)
+#   FENCE_TIMEOUT             peer timeout seconds (default: 3)
+#   FENCE_STATE_DIR           state dir (default: ~/.agent-ops)
+#   FENCE_UNREACHABLE_BOUND   seconds of peer unreachability required by --standup-ok (default: 14400 = 4h)
+#   FENCE_CONFIRM             consecutive clear verdicts required by --standup-ok (default: 2)
+#
+# Flags
+#   -q          quiet; exit code only
+#   --json      one-line JSON verdict
+#   --no-cache  force a probe
+#   --history   print recent verdicts
+#   --standup-ok  exit 0 only if promotion policy allows (see docs/RUNBOOK.md)
+#   --self-test   run built-in checks against a local stub, touch nothing else
+#
+# Exit codes: 0 active, 1 fenced, 2 unprobed, 3 usage/config error
+set -u
+
+STATE_DIR="${FENCE_STATE_DIR:-$HOME/.agent-ops}"
+PEER="${FENCE_PEER_URL:-}"
+LOCAL_FILE="${FENCE_LOCAL_EPOCH_FILE:-$STATE_DIR/local-epoch}"
+LOCAL_DEFAULT="${FENCE_LOCAL_EPOCH:-1}"
+TTL="${FENCE_TTL:-20}"
+TIMEOUT="${FENCE_TIMEOUT:-3}"
+BOUND="${FENCE_UNREACHABLE_BOUND:-14400}"
+CONFIRM="${FENCE_CONFIRM:-2}"
+
+CACHE="$STATE_DIR/fence.cache"
+HISTORY="$STATE_DIR/fence-history.jsonl"
+STANDBY_MARKER="$STATE_DIR/standby-since"
+
+QUIET=0
+JSON=0
+NO_CACHE=0
+MODE=verdict
+SELF=${BASH_SOURCE[0]}
+
+for arg in "$@"; do
+  case "$arg" in
+    -q|--quiet)   QUIET=1 ;;
+    --json)       JSON=1 ;;
+    --no-cache)   NO_CACHE=1 ;;
+    --history)    MODE=history ;;
+    --standup-ok) MODE=standup ;;
+    --self-test)  MODE=selftest ;;
+    -h|--help)    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "fence: unknown flag $arg" >&2; exit 3 ;;
+  esac
+done
+
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+now() { date +%s; }
+
+say() { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+
+local_epoch() {
+  if [ -r "$LOCAL_FILE" ]; then
+    tr -cd '0-9' < "$LOCAL_FILE" | head -c 9
+  else
+    printf '%s' "$LOCAL_DEFAULT"
+  fi
+}
+
+fetch_epoch() {
+  # prints the peer epoch, or nothing on failure
+  local url=$1 body
+  body=$(curl -fsS -m "$TIMEOUT" "$url" 2>/dev/null) || return 1
+  case "$body" in
+    ''|*[!0-9]*)
+      printf '%s' "$body" | grep -oE '"epoch"[[:space:]]*:[[:space:]]*[0-9]+' \
+        | grep -oE '[0-9]+' | tail -1 ;;
+    *) printf '%s' "$body" ;;
+  esac
+}
+
+emit() { # state local peer
+  local state=$1 local_e=$2 peer_e=$3 ts
+  ts=$(now)
+  if [ "$JSON" = 1 ]; then
+    printf '{"state":"%s","local":%s,"peer":%s,"ts":%s}\n' \
+      "$state" "${local_e:-null}" "${peer_e:-null}" "$ts"
+  else
+    case "$state" in
+      active)   say "fence: ACTIVE (local epoch ${local_e} >= peer ${peer_e:-?})" ;;
+      fenced)   say "fence: FENCED (peer epoch ${peer_e} > local ${local_e}) - this node must stand down" ;;
+      unprobed) say "fence: ACTIVE-UNPROBED (peer did not answer within ${TIMEOUT}s)" ;;
+    esac
+  fi
+}
+
+write_cache() { # ts state local peer
+  printf '%s %s %s %s\n' "$1" "$2" "${3:--}" "${4:--}" > "$CACHE" 2>/dev/null || true
+}
+
+read_cache() {
+  [ "$NO_CACHE" = 1 ] && return 1
+  [ -r "$CACHE" ] || return 1
+  local ts state local_e peer_e
+  read -r ts state local_e peer_e < "$CACHE" || return 1
+  [ -n "${ts:-}" ] || return 1
+  [ $(( $(now) - ts )) -le "$TTL" ] || return 1
+  CACHED_TS=$ts CACHED_STATE=$state CACHED_LOCAL=$local_e CACHED_PEER=$peer_e
+  return 0
+}
+
+append_history() { # ts state local peer
+  printf '{"ts":%s,"state":"%s","local":%s,"peer":%s}\n' \
+    "$1" "$2" "$3" "$4" >> "$HISTORY" 2>/dev/null || true
+  # bounded history: keep the last 2000 probes
+  if [ -f "$HISTORY" ] && [ "$(wc -l < "$HISTORY")" -gt 2000 ]; then
+    tail -1000 "$HISTORY" > "$HISTORY.tmp" && mv "$HISTORY.tmp" "$HISTORY"
+  fi
+}
+
+# ---------- standup policy -------------------------------------------------
+# Promotion is a deliberate act. --standup-ok encodes a conservative rule for
+# stacks that want it: the peer must have been unreachable for BOUND seconds,
+# this node must have recorded that it served as standby for that whole window
+# (the runner touches $STANDBY_MARKER when it declines to start), and the last
+# CONFIRM fresh verdicts must be clear. It never bumps an epoch.
+standup_ok() {
+  [ -r "$HISTORY" ] || { say "standup: no history - stay standby"; return 1; }
+  local last_nonactive span marker_age
+  # robust parse (jq is not assumed)
+  last_nonactive=$(python3 - "$HISTORY" <<'PY'
+import json, sys
+last = None
+for line in open(sys.argv[1]):
+    try:
+        r = json.loads(line)
+    except Exception:
+        continue
+    if r.get("state") != "active":
+        last = r.get("ts")
+print(last if last is not None else "")
+PY
+)
+  [ -n "$last_nonactive" ] || { say "standup: no observed outage - stay standby"; return 1; }
+  span=$(( $(now) - last_nonactive ))
+  [ "$span" -ge "$BOUND" ] || {
+    say "standup: peer unreachable only ${span}s (need ${BOUND}s) - stay standby"; return 1; }
+  [ -e "$STANDBY_MARKER" ] || {
+    say "standup: no standby-tenure marker - stay standby"; return 1; }
+  marker_age=$(( $(now) - $(stat -c %Y "$STANDBY_MARKER" 2>/dev/null || echo "$(now)") ))
+  [ "$marker_age" -ge "$BOUND" ] || {
+    say "standup: served as standby only ${marker_age}s - stay standby"; return 1; }
+  local recent
+  recent=$(tail -n "$CONFIRM" "$HISTORY" | python3 -c '
+import json,sys
+rows=[json.loads(l) for l in sys.stdin if l.strip()]
+print("clear" if rows and all(r.get("state")=="active" for r in rows) else "not")')
+  [ "$recent" = clear ] || { say "standup: need ${CONFIRM} consecutive clear verdicts - stay standby"; return 1; }
+  say "standup: allowed (peer unreachable ${span}s, standby tenure ${marker_age}s, last ${CONFIRM} verdicts clear)"
+  return 0
+}
+
+# ---------- self-test ------------------------------------------------------
+# Proves the three verdicts against a local stub. Touches only a temp dir.
+selftest() {
+  local tmp pass=0 fail=0 spid="" port="" rc
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fence-selftest.XXXXXX") || return 3
+  cat > "$tmp/stub.py" <<'PY'
+import http.server, json, sys
+state = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"epoch": int(open(state).read())}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_port, flush=True)
+srv.serve_forever()
+PY
+  echo 9 > "$tmp/epoch"
+  python3 "$tmp/stub.py" "$tmp/epoch" > "$tmp/port" 2>/dev/null &
+  spid=$!
+  local i
+  for i in $(seq 1 50); do
+    port=$(cat "$tmp/port" 2>/dev/null)
+    [ -n "$port" ] && break
+    sleep 0.1
+  done
+  check() { # label expected-rc actual-rc
+    if [ "$2" = "$3" ]; then echo "  ok   $1 (rc=$3)"; pass=$((pass+1))
+    else echo "  FAIL $1 (expected rc=$2, got rc=$3)"; fail=$((fail+1)); fi
+  }
+  [ -n "$port" ] || { echo "  FAIL stub server did not start"; rm -rf "$tmp"; return 1; }
+
+  FENCE_STATE_DIR="$tmp/s1" FENCE_LOCAL_EPOCH=1 FENCE_TIMEOUT=1 FENCE_TTL=0 \
+    FENCE_PEER_URL="http://127.0.0.1:$port/" "$SELF" -q --no-cache; rc=$?
+  check "higher peer epoch fences this node" 1 "$rc"
+
+  FENCE_STATE_DIR="$tmp/s2" FENCE_LOCAL_EPOCH=9 FENCE_TIMEOUT=1 FENCE_TTL=0 \
+    FENCE_PEER_URL="http://127.0.0.1:$port/" "$SELF" -q --no-cache; rc=$?
+  check "equal or higher local epoch stays active" 0 "$rc"
+
+  FENCE_STATE_DIR="$tmp/s3" FENCE_LOCAL_EPOCH=1 FENCE_TIMEOUT=1 FENCE_TTL=0 \
+    FENCE_PEER_URL="http://127.0.0.1:$port/" "$SELF" -q --no-cache >/dev/null
+  FENCE_STATE_DIR="$tmp/s3" FENCE_LOCAL_EPOCH=1 FENCE_TIMEOUT=1 FENCE_TTL=300 \
+    FENCE_PEER_URL="http://127.0.0.1:1/" "$SELF" -q; rc=$?
+  check "cache serves a fresh verdict without re-probing" 1 "$rc"
+
+  kill "$spid" 2>/dev/null || true
+  wait "$spid" 2>/dev/null || true
+  FENCE_STATE_DIR="$tmp/s4" FENCE_LOCAL_EPOCH=1 FENCE_TIMEOUT=1 FENCE_TTL=0 \
+    FENCE_PEER_URL="http://127.0.0.1:$port/" "$SELF" -q --no-cache; rc=$?
+  check "unreachable peer reports unprobed" 2 "$rc"
+
+  rm -rf "$tmp"
+  echo "self-test: ${pass} passed, ${fail} failed"
+  [ "$fail" -eq 0 ]
+}
+
+# ---------- main -----------------------------------------------------------
+if [ "$MODE" = selftest ]; then selftest; exit $?; fi
+if [ "$MODE" = history ]; then tail -n 20 "$HISTORY" 2>/dev/null || echo "no history"; exit 0; fi
+
+TS=$(now)
+
+if read_cache; then
+  STATE=$CACHED_STATE LOCAL_E=$CACHED_LOCAL PEER_E=$CACHED_PEER
+  if [ "$MODE" = verdict ]; then
+    if [ "$JSON" = 1 ]; then
+      emit "$STATE" "${LOCAL_E/-/}" "${PEER_E/-/}"
+    elif [ "$QUIET" = 0 ]; then
+      case "$STATE" in
+        active) say "fence: ACTIVE (cached)" ;;
+        fenced) say "fence: FENCED (cached)" ;;
+        unprobed) say "fence: ACTIVE-UNPROBED (cached)" ;;
+      esac
+    fi
+  fi
+else
+  [ -n "$PEER" ] || { echo "fence: FENCE_PEER_URL is required" >&2; exit 3; }
+  LOCAL_E=$(local_epoch)
+  PEER_E=$(fetch_epoch "$PEER" || true)
+  if [ -z "${PEER_E:-}" ]; then
+    STATE=unprobed
+  elif [ "$PEER_E" -gt "$LOCAL_E" ] 2>/dev/null; then
+    STATE=fenced
+  else
+    STATE=active
+  fi
+  write_cache "$TS" "$STATE" "$LOCAL_E" "${PEER_E:--}"
+  append_history "$TS" "$STATE" "$LOCAL_E" "${PEER_E:-null}"
+  [ "$MODE" = verdict ] && emit "$STATE" "$LOCAL_E" "${PEER_E:-}"
+fi
+
+case "$MODE" in
+  history) tail -n 20 "$HISTORY" 2>/dev/null || echo "no history" ;;
+  standup) standup_ok; exit $? ;;
+esac
+
+case "$STATE" in
+  active)   exit 0 ;;
+  fenced)   exit 1 ;;
+  unprobed) exit 2 ;;
+  *)        exit 3 ;;
+esac
