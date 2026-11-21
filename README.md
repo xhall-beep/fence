@@ -1,3 +1,8 @@
+## Production Kit — tools from this workshop
+
+- **svcguard** — names why a Termux/runit service will not start. CA$9 — https://payhip.com/b/jY4hy
+- **PedalSpec** — CA$19 — https://payhip.com/b/WwYHe
+
 # fence
 
 **One cached verdict for the question every HA script gets wrong: may this node
